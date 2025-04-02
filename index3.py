@@ -32,40 +32,29 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 # Configure Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Dictionary to store conversation history
-chat_history = {}
-
-# Function to send the user's query and relevant text to Gemini for a response
-def send_to_gemini(query, retrieved_text, source):
+def send_to_gemini(query, retrieved_text):
     try:
         model = genai.GenerativeModel("gemini-2.0-flash")
-        
-        # Retrieve previous conversation history for the source
-        previous_history = chat_history.get(source, "")
-        
         prompt = f"""
-        Given the following conversation history, user query, and relevant extracted text, generate a concise response.
+        Given the following query and relevant extracted text, generate a concise and relevant response.
         
-        Conversation History:
-        {previous_history}
-        
-        User Query: {query}
+        Query: {query}
         Extracted Text:
         {retrieved_text}
         
         Provide a response based on the extracted text.
         """
-        
         response = model.generate_content(prompt)
-        response_text = response.text if response else "No response generated."
-        
-        # Append to chat history for the specific source
-        chat_history[source] = previous_history + f"\nUser: {query}\nAI: {response_text}\n"
-
-        return response_text
+        return response.text if response else "No response generated."
     except Exception as e:
         st.error(f"Error generating content with Gemini: {e}")
         return f"Error generating content with Gemini: {e}"
+
+# Function to extract sub-URL
+
+def get_sub_url(url):
+    parsed_url = urlparse(url)
+    return parsed_url.path if parsed_url.path else "/"
 
 # Function to extract all links from a webpage
 def extract_links(soup, base_url):
@@ -73,31 +62,26 @@ def extract_links(soup, base_url):
     for tag in soup.find_all("a", href=True):
         full_url = urljoin(base_url, tag["href"])
         parsed_url = urlparse(full_url)
-        if parsed_url.netloc == urlparse(base_url).netloc:  # Include all internal links
-            links[full_url] = base_url
+        if parsed_url.netloc == urlparse(base_url).netloc:  # Include only internal links
+            links[full_url] = get_sub_url(full_url)
     return links
 
-# Multi-threaded crawler function with rate limiting
+# Multi-threaded crawler function
 def crawl_website(url, depth=2, visited=set(), lock=threading.Lock()):
     if depth == 0 or url in visited:
         return
     
     try:
-        time.sleep(random.uniform(1, 3))  # Random delay to avoid rate limiting
+        time.sleep(random.uniform(1, 3))
         response = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Extract and store text
         paragraphs = soup.find_all("p")
         text = " ".join([p.get_text() for p in paragraphs])
-        store_in_pinecone(text, url, "url")
+        store_in_pinecone(text, get_sub_url(url), "url")
         
-        # Extract all links and crawl further
         links = extract_links(soup, url)
         st.write(f"Scraped {len(links)} links from {url}")
-        print(f"Scraped {len(links)} links from {url}")
-        for link, ref_page in links.items():
-            print(f"Found link: {link} (from {ref_page})")
         
         threads = []
         with lock:
@@ -129,15 +113,14 @@ def store_in_pinecone(text, source, data_type):
         if any(np.isnan(vector)) or any(np.isinf(vector)):
             st.error("Error: Vector contains NaN or Inf values. Skipping this chunk.")
             continue
-        vectors.append((source + str(hash(chunk)), vector, {"source": source, "text": chunk, "type": data_type}))
+        vectors.append((f"{source}-{hash(chunk)}", vector, {"source": source, "text": chunk, "type": data_type}))
     
     if vectors:
         index.upsert(vectors)
 
 # Streamlit UI
-st.title("Web & PDF Search with Pinecone and Gemini")
+st.title("Web & PDF Chatbot with Pinecone and Gemini")
 
-# Input options
 option = st.radio("Select Input Type:", ("URL", "PDF"))
 
 if option == "URL":
@@ -154,9 +137,12 @@ elif option == "PDF":
             store_in_pinecone(text, pdf_file.name, "pdf")
         st.success("PDF data stored in Pinecone!")
 
-# Query handling
+# Chat logic
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = {}
+
 query = st.text_input("Ask a question:")
-if query and st.button("Search"):
+if query and st.button("Chat"):
     query_vector = model.encode(query).tolist()
     
     index_stats = index.describe_index_stats()
@@ -165,15 +151,24 @@ if query and st.button("Search"):
     if len(query_vector) != expected_dim:
         st.error(f"Error: Query vector has incorrect dimensions. Expected {expected_dim}, got {len(query_vector)}.")
     else:
-        results = index.query(vector=query_vector, top_k=10, include_metadata=True)
-        current_source = url if option == "URL" else pdf_files[0].name if pdf_files else None
-        filtered_results = [match for match in results["matches"] if match["metadata"].get("type") == option.lower() and match["metadata"].get("source") == current_source]
+        sub_url = get_sub_url(url)
+        if sub_url not in st.session_state.chat_history:
+            st.session_state.chat_history[sub_url] = []
         
-        if filtered_results:
-            retrieved_text = "\n".join([match["metadata"].get("text", "No text found") for match in filtered_results])
-            response = send_to_gemini(query, retrieved_text, current_source)
-            
-            st.subheader("AI Response:")
-            st.write(response)
+        results = index.query(vector=query_vector, top_k=5, include_metadata=True, filter={"source": sub_url})
+        
+        if results["matches"]:
+            retrieved_text = "\n".join([match["metadata"].get("text", "No text found") for match in results["matches"]])
+            response = send_to_gemini(query, retrieved_text)
+            st.session_state.chat_history[sub_url].append((query, response))
         else:
-            st.write("No relevant results found in the selected category.")
+            response = "No relevant results found."
+            st.session_state.chat_history[sub_url].append((query, response))
+
+# Display chat history
+st.subheader("Chat History:")
+sub_url = get_sub_url(url)
+if sub_url in st.session_state.chat_history:
+    for query, response in st.session_state.chat_history[sub_url]:
+        st.write(f"**You:** {query}")
+        st.write(f"**Bot:** {response}")
